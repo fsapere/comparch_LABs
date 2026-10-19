@@ -196,9 +196,21 @@ void pipe_stage_mem()
 #ifdef DEBUG
             printf("dcache miss (%x) at %d\n", word_add, stat_cycles);
 #endif
-            pipe.dcache_wait = 1; // update the status variables for the miss that just happened
+            int mshr_id = -1;
+            // 1 = req_from_memstage (MEM)
+            int r = l2_probe(pipe.l2cache, word_add, &mshr_id, 1);
+            if (r == -1) {
+                return; // no free MSHR, retry next cycle
+            }
+            pipe.dcache_wait = 1;
             pipe.dcache_wait_addr = word_add & ~31;
-            pipe.dcache_fill_cycle = stat_cycles + 49;            
+            if (r == 1) {
+                // L2 HIT: 15 cycles total latency (stat_cycles + 14)
+                pipe.dcache_fill_cycle = stat_cycles + 14;
+            } else {
+                // L2 MISS: variable latency, will be woken up by pipe_l2_cycle()
+                pipe.dcache_fill_cycle = NO_CYCLE;
+            }
             return;
         }
     }
@@ -753,10 +765,21 @@ void pipe_stage_fetch()
 #ifdef DEBUG
         printf("icache miss (%x) at %d\n", pipe.PC, stat_cycles);
 #endif
-        // replaced bubble counter with status flag computation
+        int mshr_id = -1;
+        // 0 = req_from_memstage (FETCH)
+        int r = l2_probe(pipe.l2cache, pipe.PC, &mshr_id, 0);
+        if (r == -1) {
+            return; // no free MSHR, retry next cycle
+        }
         pipe.icache_wait = 1;
         pipe.icache_wait_addr = pipe.PC & ~31;
-        pipe.icache_fill_cycle = stat_cycles + 49; /* TEMP (step 3): baseline latency */        return;
+        if (r == 1) {
+            // L2 HIT: 15 cycles total latency (stat_cycles + 14)
+            pipe.icache_fill_cycle = stat_cycles + 14;
+        } else {
+            // L2 MISS: variable latency, will be woken up by pipe_l2_cycle()
+            pipe.icache_fill_cycle = NO_CYCLE;
+        }
         return;
     }
 
@@ -785,16 +808,15 @@ void pipe_l2_cycle()
         mshr_t *curr_mshr = &pipe.l2cache->mshr[i];
         if (!curr_mshr->valid) continue; // do nothing if MSHR is not used
 
-        if(!curr_mshr->done)
-        {// reach here if used and not done yet
-            // increment and check if the constant latency passed
-            if (curr_mshr->latency_cnt < 5) 
-                {
-                curr_mshr->latency_cnt++;
-                if (curr_mshr->latency_cnt == 5) 
-                {
-                    // DRAM req later
-                }
+#define MOCK_DRAM_LATENCY 249 // 249 cicli in DRAM (dal ciclo 5 al 254 del PDF)
+        if (!curr_mshr->done)
+        {
+            curr_mshr->latency_cnt++;
+            // Dopo 5 cicli (L2->MC) + 249 cicli (DRAM) = 254 cicli totali:
+            if (curr_mshr->latency_cnt == 5 + MOCK_DRAM_LATENCY) 
+            {
+                // La memoria risponde: imposta done=1 e resetta latency_cnt=0
+                l2_mem_fill_notify(pipe.l2cache, i);
             }
         } else {// reach here if done and handling miss
             curr_mshr->latency_cnt++; // increment counter for cycles

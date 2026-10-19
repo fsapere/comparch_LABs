@@ -1,0 +1,497 @@
+Computer Architecture (227-2210-00L), Fall 2026
+
+1/11
+
+Lab 1: Memory Hierarchy
+Instructors: Prof. Onur Mutlu, Dr. Konstantina Koliogeorgi, Konstantinos Kanellopoulos,
+Ataberk Olgun, Dr. Nika Mansouri Ghiasi
+TAs: Rakesh Nadig, Nisa Bostanci, İsmail Emir Yüksel, Haocong Luo, Mayank Kabra,
+Andreas Kakolyris, Harshita Gupta, Konstantinos Sgouras, Harsh Songara,
+Maria Makeenkova, Sahand Divsalar, Jikun Wang, Spiros Galanopoulos,
+Eirini Tzermpou, Emre Demirli
+Corresponding TAs: Andreas Kakolyris, Spiros Galanopoulos
+Assigned: Thursday, October 8, 2026
+Due: Thursday, October 22, 2026 (Midnight)
+
+1. Introduction
+In this lab, you will extend a timing simulator to implement a memory hierarchy that includes an L2 cache
+and a DRAM-based main memory, with writebacks and refreshes. The simulator that we provide already
+models the instruction/data caches (Section 3). Similar to the instruction/data caches, we will fully specify
+the cycle-by-cycle behavior of the L2 cache and DRAM.
+While the L1 caches are tightly integrated with the pipeline, the L2 cache is more decoupled from the pipeline.
+In this lab, we will maintain the semantics for the L1 caches that are described in Section 3, but replace the
+constant L1 cache miss latency of 50 cycles with a variable latency. Every L1 miss accesses the L2 cache, and
+every L2 miss accesses DRAM. Whenever the processor would have begun a 50 cycle L1 cache miss access
+stall in the provided simulator, it instead issues a request to the memory hierarchy in this lab. When the
+data is available from the L2 or main memory (as specified below), the memory hierarchy issues a cache fill
+notification back to the L1 caches. If the L1 cache is still stalling on the missing data (i.e., no cancellation
+occurred), the data is inserted into the cache and the stall ends in the next cycle. We now specify exactly
+how the memory hierarchy is structured and how requests are handled in more detail.
+
+2. Timing Simulator
+Timing simulators compute the number of cycles that a program requires to execute on the simulated processor, without modelling the logic-level implementation of the processor. Because of this, many simplifications
+are possible:
+• We do not actually need to model control logic and datapath details in each block of the processor.
+• We only need to write code for each stage that performs the relatively high-level function of that
+pipeline stage (read the register file, access memory, etc.).
+• In general, the simulator’s algorithms and structures do not need to exactly match the processor’s algorithms and structures, as long as the result is the same.
+Because a timing simulator lacks a low-level implementation, it cannot determine the critical path (or other
+cost metrics that we care about, e.g., area taken on a silicon chip, power consumed during operation). It can,
+however, determine how many cycles a program takes, assuming it models the cycle-level behavior accurately.
+
+3. Instruction and Data Caches
+The simulator that we provide models a MIPS machine with the following instruction/data caches.
+
+3.1. Instruction Cache
+The instruction cache is accessed every cycle by the fetch stage.
+Organization. It is a four-way set-associative cache that is 8 KB in size with 32-byte blocks (this implies
+that the cache has 64 sets). When accessing the cache, the set index is calculated using bits PC[10:5].
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+2/11
+
+Miss Timing. When the fetch stage misses in the instruction cache, the block must be retrieved from main
+memory. In the given simulator, an access to main memory takes 50 cycles. On the 50th cycle, the new block
+is inserted into the cache. In total, an instruction cache miss stalls the pipeline for 50 cycles.
+Replacement. When a new block is retrieved from main memory, it is inserted into the appropriate set within
+the instruction cache. If any way within the set is empty (i.e., invalid), the new block is simply inserted into the
+invalid way. However, if none of the ways in the set are empty, the new block replaces the least-recently-used
+block in the set. For both cases, the new block becomes the most-recently-used block.
+Control-Flow. While the fetch stage is stalled due to a miss in the instruction cache, a control-flow instruction further down the pipeline may redirect the PC. As a result, the pending miss may turn out to be
+unnecessary: it is retrieving the wrong block from main memory. In this case, the pending miss is canceled:
+the block that is eventually returned by main memory is not inserted into the cache – even if the redirection
+happens on the very last stall cycle.1 Finally, note that when the PC is redirected to an address pointing to
+the same block as the pending miss, the pending miss should not be canceled.
+
+3.2. Data Cache
+The data cache is accessed whenever a load or store instruction is in the memory stage.
+Organization. It is an eight-way set-associative cache that is 64 KB in size with 32-byte blocks (this implies
+that the cache has 256 sets). When accessing the cache, the set index is calculated using bits [12:5] of the
+data address that is being loaded/stored.
+Miss Timing & Replacement. Miss timing and replacement of the data cache are identical to those of the
+instruction cache.
+Handling Stores. Both load and store misses stall the pipeline for 50 cycles. They both retrieve a new block
+from main memory and insert it into the cache.
+
+3.3. Assumptions about Instruction & Data Caches
+• Assume that both caches are initially empty (i.e., all blocks are invalid).
+• In both caches, every block has a separate tag that stores information about the block: e.g., address,
+valid, recency, etc. Tags are initialized to 0.
+• Assume that the program that runs on the processor never modifies its own code (referred to as selfmodifying code): a given block cannot reside in both caches.
+
+4. Task 1/4: Extending the Simulator with an L2 Cache
+The unified L2 cache is accessed whenever there is a miss in either of the two L1 caches (instruction or data).
+Organization. It is a 16-way set-associative cache that is 256 KB in size with 32-byte blocks (this implies
+that the cache has 512 sets, which requires 9 bits to be used to index a set). When accessing the cache, the
+set index is equal to [13:5] of the address.
+MSHRs. The L2 cache has 16 MSHRs (miss-status holding registers), which is more than enough for our simple
+in-order pipeline. For every L2 cache miss, the L2 cache allocates an MSHR that keeps track of the miss. An
+MSHR consists of three fields: (i) valid bit, (ii) address of the cache block that triggered the miss, and (iii)
+done bit. All fields are initialized to 0. When main memory serves an L2 cache miss, it sends a fill notification
+to the L2 cache that sets the done bit in the corresponding MSHR. The MSHR is freed when the cache block
+is inserted into the L2 cache.
+Accessing the L2 Cache. Assume that the L2 cache has a large number of ports and that accesses to it
+are never serialized. When a memory access misses in either of the L1 caches, the L2 cache is “probed”2
+1 Note that this might not be a good idea, but this is our specification of the processor. If you are interested in the effects of “wrongpath” execution on processor performance, please see Mutlu et al. [1, 2].
+2 Probing is when the tags are searched to determine the hit/miss status of an access.
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+3/11
+
+immediately in the same cycle as the L1 cache miss. Depending on whether the access hits or misses in the
+L2 cache, it is handled differently.
+• L2 Cache Hit. The L2 cache sends a fill notification to the L1 cache (instruction or data) 14 cycles
+after the probe. For example, if an access misses in an L1 cache but hits in the L2 cache at the 0th cycle,
+then the L1 cache receives a fill notification at the 14th cycle and the stalled pipeline stage proceeds at
+the 15th cycle. In total, an L2 cache hit stalls the pipeline for 15 cycles (compare with the 50-cycle stall
+in Section 3).
+• L2 Cache Miss. Immediately, the L2 cache allocates an MSHR for the miss. After 5 cycles, the L2
+cache sends a memory request to main memory (this models the latency between the L2 cache and
+the memory controller). When the memory request is served by main memory, the L2 cache receives
+a fill notification. After 5 cycles, the retrieved cache block is inserted into the L2 cache and the corresponding MSHR is freed (this models the latency between the memory controller and the L2 cache).
+In the same cycle, if the pipeline is stalled because of the cache block, then the L2 cache sends a fill
+notification to the L1 cache. Also in the same cycle, the cache block is inserted into the L1 cache. In
+the next cycle, the pipeline becomes unstalled.
+Management Policies. A new cache block is inserted into the L2 cache at the most recently used (MRU )
+position. For an L2 cache hit, a cache block is promoted to the MRU position. In the same cycle, there can be
+as many as two L2 cache hits: one from the fetch stage and another from the memory stage. If they happen
+to hit in two different cache blocks that belong to the same set, then there is an ambiguity about which block
+is promoted to the MRU position. In this case, we assume that the memory stage accesses the L2 cache before
+the fetch stage: we promote the block that is requested by the fetch stage to the MRU position and the block
+that is requested by the memory stage to the MRU-1 position. The L2 cache adopts true LRU replacement.
+Other Assumptions and Policies.
+• Assume that the L2 cache is initially empty.
+• Unlike an L1 cache access, an L2 cache access cannot be canceled once it has been initiated.
+• Tasks 1 and 2 do not model dirty cache blocks or writebacks: all caches behave as if every block is clean.
+Task 3 (Section 6) adds dirty bits and writebacks.
+• When the L2 cache does not have any free MSHRs remaining (which should not happen in our simple
+in-order pipeline), then an L1 cache miss cannot even probe the L2 cache. In other words, a free MSHR
+is a prerequisite for an access to the L2 cache, regardless of whether the access would actually hit or
+miss in the L2 cache. A freed MSHR can be re-allocated to another L2 cache miss in the same cycle.
+• Each L1 cache miss stalls its pipeline stage until the L1 cache receives the fill notification, as in the
+provided simulator: an instruction cache miss stalls the fetch stage, and a data cache miss stalls the
+memory stage. The two stages stall independently. For example, while a data cache miss stalls an
+older instruction in the memory stage, the fetch stage can miss in the instruction cache on a younger
+instruction. As a result, at most two L1 cache misses are outstanding at any time. If both miss in the L2
+cache, each one allocates its own MSHR.
+• In an ideal design, when an instruction is stalled in the pipeline due to an L1 cache miss, the pipeline
+should be able to process other instructions if 1) there is no data dependence with the stalled instruction,
+and 2) there are MSHRs available to allocate. However, implementing this design is not a requirement
+in order to get the full grade (i.e., the pipeline can be stalled as explained in the item above).
+
+5. Task 2/4: Extending the Simulator with a DRAM Model
+Organization. The DRAM system has a single rank on a single channel, where the channel consists of the
+command/address bus and the data bus. The rank has eight banks. Each bank consists of 64K rows, where
+each row is 8 KB in size. When accessing main memory, the bank index is equal to [7:5] of the address and
+the row index is equal to [31:16] of the address. For example, the 32-byte cache block at address 0x00000000
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+4/11
+
+is stored in the 0th row of the 0th bank. As another example, the 32-byte cache block at address 0x00000020
+is stored in the 0th row of the 1st bank.
+Memory Controller. The memory controller holds the memory requests received from the L2 cache in a
+request queue. The request queue can hold an infinite number of memory requests. In each cycle, the memory
+controller scans the request queue (including the memory requests that arrived during the current cycle) to
+find the requests that are “schedulable” (to be described later). If there is only one schedulable request, the
+memory controller initiates the DRAM access for that request. If there are multiple schedulable requests, the
+memory controller prioritizes the requests in the following order, which is similar to the FR-FCFS policy:
+1. requests that are row buffer hits are prioritized over others
+2. requests that arrived earlier are prioritized over others
+3. requests coming from the memory stage are prioritized over others
+DRAM Commands & Timing. A DRAM access consists of a sequence of commands issued to a DRAM
+bank. There are four DRAM commands: ACTIVATE (issued with the bank/row addresses), READ/WRITE (issued
+with the column address), and PRECHARGE (issued with the bank address). Each command utilizes the command/address bus for 4 cycles. Once a DRAM bank receives a command, it becomes “busy” for 100 cycles
+and cannot accept any other commands. 100 cycles after receiving a READ or WRITE command, the bank is
+ready to send/receive a 32-byte chunk of data over the data bus – this transfer utilizes the data bus for 50
+cycles.
+Row Buffer Status. Each DRAM bank has a row buffer. Depending on the status of the bank’s row buffer,
+a different sequence of commands is required to serve a memory request to the bank. For example, let us
+assume that a memory request needs to access the 0th row in the 0th bank. At this point, there are three
+possible scenarios:
+• Row buffer hit: when the 0th row is already in the row buffer
+• Row buffer miss: when there is no row loaded in the corresponding bank’s row buffer
+• Row buffer conflict: when a row different from the 0th row is loaded in the corresponding bank’s row
+buffer
+The following table summarizes the sequence of commands that is required for each of the three scenarios.
+Scenario
+
+Commands
+
+Row Buffer Hit
+
+READ/WRITE
+
+Row Buffer Miss
+
+ACTIVATE, READ/WRITE
+
+Row Buffer Conflict
+
+PRECHARGE, ACTIVATE, READ/WRITE
+
+“Schedulable” Request. A memory request is defined to be schedulable when all of its commands can be
+issued without any conflict on the command/address bus, the data bus, and the bank, at the cycles when
+commands are to be issued and corresponding data is to be expected. For example, at the 0th cycle, a request
+to a bank with a closed row buffer is schedulable if and only if all of the following conditions are met:
+1. The command/address bus is free at cycles 0, 1, 2, 3, 100, 101, 102, and 103
+2. The data bus is free during cycles 200-249
+3. The bank is free during cycles 0-99 and 100-199
+Example: an L2 Cache Miss to a Closed Row. Assume that the DRAM is idle and all row buffers are closed.
+An L1 cache miss that misses in the L2 cache in cycle 0 proceeds as follows:
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+5/11
+
+• Cycle 0: L1 cache miss, L2 cache miss, MSHR allocated.
+• Cycle 5: the read request reaches the memory controller, which schedules it immediately: ACTIVATE
+uses the command/address bus in cycles 5–8 and READ in cycles 105–108; the bank is busy in cycles
+5–204.
+• Cycles 205–254: data transfer. Main memory serves the request in cycle 254, the last cycle of the transfer
+(the MSHR done bit is set).
+• Cycle 259: the block is inserted into the L2 cache and the L1 cache, and the MSHR is freed.
+• Cycle 260: the stalled stage proceeds.
+In total, an L2 cache miss to a closed row stalls the pipeline for 260 cycles when the DRAM is idle; a row
+buffer hit stalls it for 160 cycles and a row buffer conflict for 360 cycles (compare with the 15-cycle stall of an
+L2 cache hit in Task 1).
+Other Assumptions and Policies.
+• Assume that the row buffers of all the banks are initially closed, i.e., there is no row in any row buffer.
+• The memory controller follows the open row policy, i.e., once a row is opened it is not closed unless
+another scheduled request requires the closing of the row to access another row in the same bank.
+
+6. Task 3/4: Modeling Writebacks
+In this task, you need to extend the simulator by modelling writebacks. In Tasks 1 and 2, every cache block
+is clean, so an evicted cache block simply disappears. In a write-back cache, a store modifies only the cached
+copy of a block, which makes the block dirty. When the cache evicts a dirty block, it must write the block
+into the immediately lower level of the memory hierarchy. This task adds two kinds of writebacks. First, the
+L1 data cache writes its evicted dirty blocks into the L2 cache. Second, the L2 cache writes its evicted dirty
+blocks into main memory. Writes to main memory compete with reads for the DRAM banks and buses, so
+writebacks can delay L2 cache misses.
+Dirty Bits. The L1 data cache and the L2 cache are write-back caches. Each cache block has a dirty bit, which
+is initialized to 0. A store that hits in the L1 data cache sets the dirty bit of the cache block. A store that
+misses in the L1 data cache retrieves the cache block as on a load miss; when the stall ends, the store hits in
+the cache and sets the dirty bit. The L1 instruction cache never holds dirty cache blocks.
+L1 Writebacks. When a newly inserted cache block evicts a dirty cache block from the L1 data cache, the
+dirty cache block is written into the L2 cache in the same cycle. For simplicity, assume that L1 writebacks to
+the L2 cache do not require a free MSHR, do not allocate an MSHR, and do not stall the pipeline. If the cache
+block hits in the L2 cache, its dirty bit is set and it is promoted to the MRU position. If the cache block misses
+in the L2 cache, it is inserted into the L2 cache as dirty at the MRU position, without retrieving it from main
+memory.
+L2 Writebacks. When a newly inserted cache block evicts a dirty cache block from the L2 cache, the L2 cache
+sends a write request for the dirty cache block to the memory controller. A write request does not allocate an
+MSHR. After 5 cycles, the write request arrives at the memory controller (similar to a read request).
+Order of Events. When the L2 cache inserts a cache block retrieved from main memory (5 cycles after main
+memory serves the L2 cache miss), the L1 cache then inserts the cache block, and then the L1 writeback (if
+any) is written into the L2 cache, all in the same cycle. Each insertion can evict a dirty cache block, which
+generates a writeback as described above. A writeback never delays an insertion: an L2 writeback only adds
+a write request to the request queue.
+Write Requests. Write requests are held in the same request queue as read requests. A write request requires the same sequence of commands as a read request, with WRITE instead of READ, and utilizes the command/address bus, the data bus, and the bank in the same cycles. The memory controller prioritizes the
+schedulable requests in the following order:
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+6/11
+
+1. requests that are row buffer hits are prioritized over others (same as in Task 2)
+2. requests that arrived earlier are prioritized over others (same as in Task 2)
+3. read requests are prioritized over write requests
+4. read requests coming from the memory stage are prioritized over read requests coming from the fetch
+stage (same as in Task 2)
+5. if requests still tie, the request that was created first is prioritized; for example, when a single insertion
+causes two writebacks, the write request caused by the L2 cache insertion precedes the write request
+caused by the L1 writeback
+A write request leaves the request queue when it is scheduled, and main memory does not send a fill notification for it. The memory controller does not forward data from a write request to a read request to the same
+cache block. Dirty cache blocks that remain in the caches at the end of the simulation are not written back.
+
+7. Task 4/4: Modeling DRAM Refreshes
+You need to add support for refreshes in your simulator. The simulator with support for refreshes should
+model periodic refresh of every single DRAM row. These refreshes should be issued by the memory controller.
+You need to accurately model the contention caused by refreshes to other requests and ensure refresh requests
+occupy request queue entries in the memory controller, and take time.
+Refresh Requests. The refresh rate should be configurable with a single constant, REFRESH INTERVAL. The
+memory controller inserts a refresh request into the request queue every REFRESH INTERVAL cycles, starting
+in cycle REFRESH INTERVAL. A value of 0 disables refreshes. Your simulator should use REFRESH INTERVAL =
+1000. The k-th refresh request (k = 0, 1, 2, . . .) refreshes row ⌊k/8⌋ mod 65536 of bank k mod 8.
+Refresh Commands & Timing. If the row buffer of the bank is closed, a refresh requires an ACTIVATE
+command (cycle 0) and a PRECHARGE command (cycle 100), and the bank is busy during cycles 0-199. If the
+row buffer of the bank is open (with any row), a refresh requires a PRECHARGE command (cycle 0), an ACTIVATE
+command (cycle 100), and a PRECHARGE command (cycle 200), and the bank is busy during cycles 0-299. A
+refresh does not utilize the data bus. After a refresh, the row buffer of the bank is closed.
+Scheduling Refreshes. Refresh requests are prioritized over all other requests. A refresh request can be
+scheduled as early as the cycle in which it is inserted into the request queue. A refresh request is schedulable
+when the bank is free and the command/address bus is free at the cycles when its commands are to be issued.
+While a refresh request to a bank is in the request queue, no other request to that bank is scheduled. Refresh
+requests to the same bank are scheduled in the order in which they are inserted.
+Report for Tasks 3 and 4. Please write a report (report writeback refresh.pdf) that briefly summarizes
+(i) the writeback and refresh mechanisms that you implemented, (ii) how writebacks and refreshes affect
+performance and cache hit/miss rates, and (iii) any other optimizations that you implemented.
+For (ii), compare your simulator against the same simulator with writebacks and/or refreshes disabled. To enable this comparison, keep writebacks and refreshes switchable with two C preprocessor macros, MODEL WRITEBACKS
+and REFRESH INTERVAL. The provided src/pipe.h defines both macros with #ifndef guards, so a -D compiler flag overrides them:
+#ifndef MODEL_WRITEBACKS
+#define MODEL_WRITEBACKS 1 /* 0: no dirty bits and no writebacks (Tasks 1 and 2 only) */
+#endif
+#ifndef REFRESH_INTERVAL
+#define REFRESH_INTERVAL 1000 /* 0: no refreshes */
+#endif
+
+Do not redefine these macros anywhere else. Submit your code with these default values (writebacks on,
+REFRESH INTERVAL = 1000). We may build the other configurations of your simulator, for example with gcc
+-g -O2 -DMODEL WRITEBACKS=0 -DREFRESH INTERVAL=0 src/*.c -o sim.
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+7/11
+
+8. Extra Credit
+We will offer up to 25% extra credit for this lab for evaluating the performance characteristics of the caches in
+your simulator. A fully correct implementation of this lab is a prerequisite for extra credit. You can evaluate
+the following design characteristics:
+1. Cache size, block size, associativity: a sweep of cache parameters. You should write a set of benchmarks that use significant amounts of memory (for example, accessing a large array in streaming or
+random patterns), and run your simulator to measure IPC for various cache parameters. Show how
+changing the associativity, block size, and cache size affect performance.
+2. Replacement and insertion policies: an exploration of cache replacement and/or insertion policies.
+The cache replacement policy specifies which cache block in a set is replaced when a new block is inserted
+into the cache. The cache insertion policy specifies where in the list of blocks the new block is placed. Up
+to now, we have used a replacement policy that evicts (replaces) the least-recently-used block, and an
+insertion policy that places new blocks at the most-recently-used position. However, other replacement
+and insertion policies have been studied, and some have been shown to achieve significantly better
+performance (fewer cache misses) for certain access patterns [3, 4]. You should experiment with a
+variety of test programs and optimize the cache replacement/insertion policy.
+3. Hash functions and other optimizations: an exploration of the functions that map cache blocks to
+cache sets. Up to now, we have used a set index that is equal to the address bits directly above the block
+offset (e.g., bits [12:5] for the data cache). With this mapping, cache blocks that are accessed frequently
+can map to the same set and cause conflict misses. You should experiment with more sophisticated
+hashing functions (e.g., XOR-based hashing of higher-order address bits) and/or using more than one
+hashing function [5], and evaluate their effect on the cache miss rate and performance. Optionally, you
+may also choose to experiment with other aspects of the cache. For example, implementing a victim
+cache is a possibility [6].
+Note that an important part of evaluating the performance characteristics is comparing against a sensible
+baseline. For example, if the baseline does not model the main memory latency while your design does, a
+comparison of cycle counts will not be meaningful. It is your job to discuss and compare against appropriate
+baselines for each design that you evaluate.
+Please write a report (report cache.pdf) that summarizes:
+i Your observations on the effect of each cache parameter.
+ii Your findings on cache replacement/insertion policies.
+iii Your findings on hash functions and any other optimizations you implement.
+Please also submit the version of your simulator (src/) that implements the best performing cache design(s).
+This version of the simulator and the report should be submitted under their own folder within the same
+tarball that you submit (see Section 11 for a detailed list of what to submit).
+
+9. Lab Resources
+9.1. Source Code
+The source code that we provide for this lab implements the instruction/data caches described in Section 3.
+Do NOT modify any files or folders unless explicitly specified in the list below.
+• Makefile
+• run.py: Script that runs your simulator and compares it against the baseline simulator. You may need
+to modify this script for your own debugging. However, your submission must work with the unmodified version.
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+8/11
+
+• src/: Source code (Modifiable; feel free to add more files)
+– pipe.c: Your simulator (Modifiable)
+– pipe.h: Your simulator (Modifiable)
+– cache.c: Instruction/data caches (Modifiable)
+– cache.h: Instruction/data caches (Modifiable)
+– mips.h: MIPS related pound defines
+– shell.c: Interactive shell for your simulator
+– shell.h: Interactive shell for your simulator
+• inputs/: Example test inputs for your simulator (Modifiable; feel free to add more files)
+
+9.2. Makefile
+We provide a Makefile that automates the compilation and verification of your simulator.
+The first time you use the Makefile you should compile the baseline simulator:
+$ make basesim
+This will generate basesim, which is the baseline simulator corresponding to the code we provide. You can
+use it to verify the output of a program you run on your simulator. Note that the output of a program should
+always match the output obtained by running the program on the baseline simulator. However, the execution
+time of a program on the two simulators will not be the same after the addition of the L2 Cache and the DRAM.
+To compile your simulator:
+$ make
+To compile your simulator and check it against the baseline simulator using one or more test inputs:
+$ make run INPUT=inputs/inst/addiu.x
+$ make run INPUT="inputs/inst/*.x"
+$ make run
+
+10. Getting Started & Tips
+10.1. Lecture Materials that Would be Useful to Study
+To get started with this lab, we highly recommend you to study the following relevant materials from Digital
+Design and Computer Architecture (Spring 2023) course, which can be accessed at:
+https://safari.ethz.ch/digitaltechnik/spring2023/doku.php?id=schedule:
+• L21: Memory Organization and Memory Technology - PDF, PPT, Video
+• L22: Memory Hierarchy and Caches - PDF, PPT, Video
+• L23: Cache Design and Management - PDF, PPT, Video
+• L24a: Advanced Caches - PDF, PPT, Video
+
+10.2. The Goal
+We provide you with a skeleton of the timing simulator that models a five-stage MIPS pipeline with instruction/data caches: pipe.c, pipe.h, cache.c, and cache.h. As it is, the simulator is already architecturally
+correct: it can correctly execute any arbitrary MIPS program that only uses the implemented instructions3 .
+3 This is not entirely true since we pose the usual restrictions on system calls, exceptions, etc.
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+9/11
+
+When the simulator detects data dependences, it correctly handles them by stalling and/or bypassing. When
+the simulator detects control dependences, it correctly handles them by stalling the pipeline as necessary.
+By executing the following command, you can see that your simulator (sim) does indeed have identical architectural outputs (e.g., register values) as the baseline simulator (basesim) for all the test inputs that we
+provide in inputs/.
+$ make run
+Your job is to model accurately the timing effects of the L2 Cache, the DRAM, writebacks, and refreshes in
+your timing simulator.
+
+10.3. Studying the Timing Simulator
+Please study pipe.c, pipe.h, cache.c, and cache.h in detail.
+The simulator models each pipeline stage as a separate function – e.g., pipe stage fetch(). The simulator
+models the state of the pipeline as a collection of pointers to Pipe Op structures (defined in pipe.h). Each
+Pipe Op represents one instruction in the pipeline by storing all of the necessary information about the
+instruction that is needed by the simulator. A Pipe Op structure is allocated when an instruction is fetched.
+It then flows through the pipeline and eventually arrives at the last stage (writeback), where it is deallocated
+once the instruction completes. To elaborate, each stage receives a Pipe Op from the previous stage, processes
+the Pipe Op, and passes it down to the next stage. The simulator models pipeline stalls by stopping the flow
+of Pipe Op structures and pipeline flushes by deallocating the Pipe Op structures at different stages.
+
+10.4. Tips
+• Please do not distribute the provided program files. These are for exclusive individual use
+of each student of the Computer Architecture course. Distribution and sharing violates the
+copyright of the software provided to you.
+• Read this handout in detail.
+• If needed, please ask questions to the TAs using the corresponding online Q&A forum in Moodle
+(https://moodle-app2.let.ethz.ch/mod/moodleoverflow/view.php?id=1463812).
+• If you encounter a technical problem, please first read the error messages. A quick web search can
+usually solve many debugging issues and error messages.
+• Use debugging tools. Learn how to use GDB/LLDB, if you are not already familiar. There is no substitute
+for stepping through code and peeking at partial values when trying to figure out where your code is
+going wrong.
+• Write additional test cases. You can use the MARS simulator to write and assemble your own MIPS32 programs. MARS is provided at https://safari.ethz.ch/digitaltechnik/spring2023/lib/
+exe/fetch.php?media=lab7 files.zip. An input file (.x) holds the assembled text segment as one
+hexadecimal instruction word per line, loaded at address 0x00400000. The data segment starts at
+0x10000000 and is 1 MB in size.
+
+10.5. Background and Reference Material
+Here are some reference materials to help you get started if you feel unfamiliar or uncomfortable with the
+topics that this assignment deals with.
+• Digital Design and Computer Architecture Spring 2023 course: https://safari.ethz.ch/digitaltechnik/
+spring2023/doku.php?id=schedule. In addition to the lectures on caches listed in Section 10.1, relevant lectures include:
+– L7: Von Neumann Model & Instruction Set Architectures (slides, video)
+– L8: Instruction Set Architectures II (slides, video)
+– L9a: ISA & Microarchitecture (slides, video)
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+10/11
+
+– L10: Microarchitecture Fundamentals & Design (slides, video)
+– L12: Pipelining (slides, video)
+• Harris and Harris textbook [7]
+– Chapter 7: Microarchitecture
+– Chapter 8.3: Caches
+
+11. Submission
+Use the corresponding assignment in Moodle (https://moodle-app2.let.ethz.ch/mod/assign/view.php?
+id=1463811). You should submit all the files needed to compile and simulate your code in a single tarball (with
+the name lab1 YourSurname YourName.tar.gz). Please include comments to explain what you have done
+in the simulator code.
+The structure of the submitted tarball should look like:
+• lab1/
+– README: (optional) any special instructions you have for us
+– main/: Source code and report for Tasks 1–4 (L2 cache, DRAM, writebacks, and refreshes)
+∗ report writeback refresh.pdf
+∗ Makefile
+∗ run.py
+∗ src/
+∗ inputs/
+– extra credit/: (optional) Source code and report for your cache exploration
+∗ report cache.pdf
+∗ most performant design/
+· Makefile
+· run.py
+· src/
+· inputs/: Also containing your set of benchmarks for memory performance
+Please feel free to include a brief README to describe any nuances of building/running your project that we
+should be aware of when grading your submission.
+
+References
+[1] O. Mutlu et al. Understanding the effects of wrong-path memory references on processor performance.
+In WMPI, 2004.
+[2] O. Mutlu et al. An analysis of the performance impact of wrong-path memory references on out-of-order
+and runahead execution processors. In IEEE TC, 2005.
+[3] M.K. Qureshi et al. Adaptive insertion policies for high performance caching. In ISCA, 2007.
+[4] V. Seshadri et al. The evicted-address filter: A unified mechanism to address both cache pollution and
+thrashing. In PACT, 2012.
+[5] A. Seznec. A case for two-way skewed-associative caches. In ISCA, 1993.
+[6] N.P. Jouppi. Improving direct-mapped cache performance by the addition of a small fully-associative
+cache and prefetch buffers. In ISCA, 1990.
+
+Computer Architecture (227-2210-00L), Fall 2026
+
+11/11
+
+[7] David Harris and Sarah Harris. Digital Design and Computer Architecture (Second Edition). Morgan Kaufmann, 2013.
+
+
