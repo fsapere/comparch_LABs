@@ -29,8 +29,8 @@ typedef struct
     int valid;
     uint32_t addr;
     int done;
-    uint32_t latency_cnt; // counter for variable latency in misses
-    int req_from_memstage; // flag to see who sent the request 
+    uint32_t latency_cnt; // Task 1, variable latency tracking (==THR -> fill)
+    int req_from_memstage; // Task 2, where is the miss coming from? FETCH vs. MEM
 } mshr_t;
 
 // L2 cache struct definition
@@ -55,7 +55,13 @@ void l2_cache_destroy(l2_cache_t *c);
 int l2_get_free_mshr(l2_cache_t *l2c);
 
 // L2 cache probe and update
-int l2_probe(l2_cache_t *l2c, uint32_t addr, int *mshr_id);
+int l2_probe(l2_cache_t *l2c, uint32_t addr, int *mshr_id, int req_from_memstage);
 int l2_cache_update(l2_cache_t *l2c, uint32_t addr, int mshr_id);
 
+// Function to implement pipe integration of the l2 cache
+void l2_cycle(l2_cache_t *l2c);
+
+// Function to refresh the L2  latency counter when the req has been served by DRAM
+void l2_mem_fill_notify(l2_cache_t *l2c, int mshr_id);
 #endif
+

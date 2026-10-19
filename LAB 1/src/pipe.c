@@ -34,6 +34,8 @@ Pipe_State pipe;
 void pipe_init()
 {
     memset(&pipe, 0, sizeof(Pipe_State));
+    pipe.icache_fill_cycle = NO_CYCLE;
+    pipe.dcache_fill_cycle = NO_CYCLE;
     pipe.PC = 0x00400000;
 
     /* 8KB, 4-way associative, 32-byte blocks (64 sets) */
@@ -58,7 +60,7 @@ void pipe_cycle()
     printf("WB   : "); print_op(pipe.wb_op);
     printf("\n");
 #endif
-
+    pipe_l2_cycle(); // advance L2 by one cycle
     pipe_stage_wb();
     if (!RUN_BIT) return;
     pipe_stage_mem();
@@ -69,9 +71,15 @@ void pipe_cycle()
     /* handle branch recoveries */
     if (pipe.branch_recover) {
         /* cancel a pending icache miss if the redirect leaves its block */
-        if (pipe.icache_bubbles > 0 &&
-                (pipe.branch_dest & ~31) != (pipe.PC & ~31))
-            pipe.icache_bubbles = 0;
+        if (pipe.icache_wait &&
+                (pipe.branch_dest & ~31) != (pipe.icache_wait_addr))
+                {
+                    // same condition as before, only updating different flags 
+                    pipe.icache_wait = 0;
+                    pipe.icache_fill_cycle = NO_CYCLE;
+                } 
+
+
 
 #ifdef DEBUG
         printf("branch recovery: new dest %08x flush %d stages\n", pipe.branch_dest, pipe.branch_flush);
@@ -154,12 +162,21 @@ void pipe_stage_wb()
 
 void pipe_stage_mem()
 {
-    /* if we are stalling on a dcache miss, count down the stall */
-    if (pipe.dcache_bubbles) {
+    // check the status bit to see if we are waiting on a L1 miss
+    if (pipe.dcache_wait) 
+    {
+
+        // check if we reached the fill cycle
+        if (stat_cycles >= pipe.dcache_fill_cycle)
+        {// L1 block is inserted in cache as soon as fill cycle is reached
+            cache_update(pipe.dcache, pipe.dcache_wait_addr);
+            pipe.dcache_wait = 0;
+            pipe.dcache_fill_cycle = NO_CYCLE; // reset status flag for misses
+        }
+
 #ifdef DEBUG
-        printf("dcache stall (%d)\n", pipe.dcache_bubbles);
+        printf("dcache fill (%x) at %d\n", pipe.dcache_wait_addr, stat_cycles);
 #endif
-        pipe.dcache_bubbles--;
         return;
     }
 
@@ -172,11 +189,16 @@ void pipe_stage_mem()
 
     /* access dcache */
     if (op->is_mem) {
-        if (!cache_update(pipe.dcache, op->mem_addr & ~3)) {
+        uint32_t word_add = op->mem_addr & ~3;
+        if (!cache_probe(pipe.dcache, word_add)) {// previously updated right away
+            // now I am just checking if the data is actually valid or not (and having it being
+            // the MRU if so) -> PDF specification
 #ifdef DEBUG
-            printf("dcache miss (%x) at %d\n", op->mem_addr & ~3, stat_cycles);
+            printf("dcache miss (%x) at %d\n", word_add, stat_cycles);
 #endif
-            pipe.dcache_bubbles = 49; /* 49 stall cycles remaining after this one */
+            pipe.dcache_wait = 1; // update the status variables for the miss that just happened
+            pipe.dcache_wait_addr = word_add & ~31;
+            pipe.dcache_fill_cycle = stat_cycles + 49;            
             return;
         }
     }
@@ -709,21 +731,20 @@ void pipe_stage_fetch()
     if (pipe.decode_op != NULL)
         return;
 
-    /* if we are stalling on an icache miss, count down the stall and fill
-     * the block on the last cycle (unless a redirect canceled the miss) */
-    if (pipe.icache_bubbles) {
+    /* if we are stalling on an icache miss, wait for fill cycle */
+    // same conceptual logic as MEM stage, but this time in FETCH for INSTRUCTIONS
+    if (pipe.icache_wait) {
+        if (stat_cycles >= pipe.icache_fill_cycle) {
+            /* insert into L1 cache unless a redirect in this cycle canceled the miss */
+            if (!pipe.branch_recover || ((pipe.branch_dest & ~31) == pipe.icache_wait_addr)) {
+                cache_update(pipe.icache, pipe.icache_wait_addr);
 #ifdef DEBUG
-        printf("icache bubble (%d)\n", pipe.icache_bubbles);
+                printf("icache fill at %d\n", stat_cycles);
 #endif
-        pipe.icache_bubbles--;
-        if (pipe.icache_bubbles == 0 &&
-                (!pipe.branch_recover || ((pipe.branch_dest & ~31) == (pipe.PC & ~31)))) {
-            cache_update(pipe.icache, pipe.PC);
-#ifdef DEBUG
-            printf("icache fill at %d\n", stat_cycles);
-#endif
+            }
+            pipe.icache_wait = 0;
+            pipe.icache_fill_cycle = NO_CYCLE;
         }
-
         return;
     }
 
@@ -732,7 +753,10 @@ void pipe_stage_fetch()
 #ifdef DEBUG
         printf("icache miss (%x) at %d\n", pipe.PC, stat_cycles);
 #endif
-        pipe.icache_bubbles = 49; /* 49 bubbles after this cycle */
+        // replaced bubble counter with status flag computation
+        pipe.icache_wait = 1;
+        pipe.icache_wait_addr = pipe.PC & ~31;
+        pipe.icache_fill_cycle = stat_cycles + 49; /* TEMP (step 3): baseline latency */        return;
         return;
     }
 
@@ -750,4 +774,45 @@ void pipe_stage_fetch()
     pipe.PC += 4;
 
     stat_inst_fetch++;
+}
+
+// This function describes how the L2 cache reacts to a cycle of pipe moving on
+void pipe_l2_cycle()
+{
+    // linear search over the MSHR registers
+    for (int i=0; i<16;i++)
+    {
+        mshr_t *curr_mshr = &pipe.l2cache->mshr[i];
+        if (!curr_mshr->valid) continue; // do nothing if MSHR is not used
+
+        if(!curr_mshr->done)
+        {// reach here if used and not done yet
+            // increment and check if the constant latency passed
+            if (curr_mshr->latency_cnt < 5) 
+                {
+                curr_mshr->latency_cnt++;
+                if (curr_mshr->latency_cnt == 5) 
+                {
+                    // DRAM req later
+                }
+            }
+        } else {// reach here if done and handling miss
+            curr_mshr->latency_cnt++; // increment counter for cycles
+            if (curr_mshr->latency_cnt == 5) {
+                // save address before MSHR is freed up
+                uint32_t addr = curr_mshr->addr;
+                // insert data from DRAM into L2 since miss is now over, data
+                // has been fetched from DRAM (+ free up the MSHR)
+                l2_cache_update(pipe.l2cache, addr, i);
+                // notify L1 caches (based on who generated the miss) that the data is now
+                // ready -> fill cycle counter gets reset, so that when pipe sees this it
+                // proceeds with the instructions that were waiting on this
+                if (pipe.dcache_wait && pipe.dcache_wait_addr == addr)
+                    pipe.dcache_fill_cycle = stat_cycles;
+                if (pipe.icache_wait && pipe.icache_wait_addr == addr)
+                    pipe.icache_fill_cycle = stat_cycles;
+            }
+        }
+    }
+
 }

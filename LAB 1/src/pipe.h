@@ -21,6 +21,7 @@
 #ifndef REFRESH_INTERVAL
 #define REFRESH_INTERVAL 1000  /* 0: no refreshes */
 #endif
+#define NO_CYCLE 0xFFFFFFFFu // fill cycle not known yet, L2 miss still in flight
 
 /* Pipeline ops (instances of this structure) are high-level representations of
  * the instructions that actually flow through the pipeline. This struct does
@@ -101,11 +102,15 @@ typedef struct Pipe_State {
 
     /* icache */
     cache_t *icache;
-    int icache_bubbles; /* currently stalling for a miss? */
+    int icache_wait;             /* fetch stalled on an L1 miss? */
+    uint32_t icache_wait_addr;   /* address of block I am waiting for (addr & ~31) */
+    uint32_t icache_fill_cycle;  /* computer L1 fill cycle, NO_CYCLE if unknown */
 
     /* dcache */
     cache_t *dcache;
-    int dcache_bubbles; /* currently stalling for a miss? */
+    int dcache_wait;
+    uint32_t dcache_wait_addr;
+    uint32_t dcache_fill_cycle;
 
     /* place other information here as necessary */
     // L2 cache & MSHR ids declaration
@@ -135,5 +140,8 @@ void pipe_stage_decode();
 void pipe_stage_execute();
 void pipe_stage_mem();
 void pipe_stage_wb();
+
+// This function describes how the L2 cache reacts to a cycle of pipe moving on
+void pipe_l2_cycle();
 
 #endif

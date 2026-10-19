@@ -9,6 +9,7 @@
 #include "cache.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 //#define DEBUG
 //#define TEST
@@ -102,10 +103,10 @@ int l2_get_free_mshr(l2_cache_t *l2c)
 
 // Probe the L2 cache
 
-int l2_probe(l2_cache_t *l2c, uint32_t addr, int* mshr_id)
+int l2_probe(l2_cache_t *l2c, uint32_t addr, int* mshr_id, int req_from_memstage)
 {
     int free_mshr = l2_get_free_mshr(l2c);
-    // check for MSHR availability
+    // check MSHR availability
     if(free_mshr == -1) return -1; // can't probe if no MSHR is free
     
     // if MSHR is free, check hit/miss
@@ -113,13 +114,13 @@ int l2_probe(l2_cache_t *l2c, uint32_t addr, int* mshr_id)
     {// miss happened, allocate MSHR
         l2c->mshr[free_mshr].valid=1;
         l2c->mshr[free_mshr].done=0;
-        l2c->mshr[free_mshr].latency_cnt = 0;
         l2c->mshr[free_mshr].addr=addr & ~31; // block address
-
+        l2c->mshr[free_mshr].latency_cnt = 0; // miss triggered the cycle wait
         // before returning, save the MSHR id of the miss
+        l2c->mshr[free_mshr].req_from_memstage = req_from_memstage;
         if (mshr_id) 
         {
-            *mshr_id = free_mshr; // <-- SALVIAMO L'INDICE QUI!
+            *mshr_id = free_mshr; // save index of first mshr to return it
         }
 
         return 0; // return 0 if you miss 
@@ -201,6 +202,17 @@ int l2_cache_update(l2_cache_t *l2c, uint32_t addr, int mshr_id)
     return hit;
 }
 
+// DRAM notifies L2 cache that that it served MEMREQ, 
+// reset cnt to 0 to track new 5 cycle latency
+void l2_mem_fill_notify(l2_cache_t *l2c, int mshr_id)
+{
+    l2c->mshr[mshr_id].done = 1;
+    l2c->mshr[mshr_id].latency_cnt = 0;
+}
+
+// this is only for handling the isolated cache, the cycle update of the cache
+// is described as a function in the pipeline file
+
 #ifdef TEST
 
 int main()
@@ -218,3 +230,5 @@ int main()
 }
 
 #endif
+
+
