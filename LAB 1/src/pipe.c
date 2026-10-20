@@ -9,6 +9,7 @@
 #include "pipe.h"
 #include "shell.h"
 #include "cache.h"
+#include "dram.h"
 #include "mips.h"
 #include <stdio.h>
 #include <string.h>
@@ -190,25 +191,27 @@ void pipe_stage_mem()
     /* access dcache */
     if (op->is_mem) {
         uint32_t word_add = op->mem_addr & ~3;
-        if (!cache_probe(pipe.dcache, word_add)) {// previously updated right away
-            // now I am just checking if the data is actually valid or not (and having it being
-            // the MRU if so) -> PDF specification
+        if (!cache_probe(pipe.dcache, word_add)) 
+        {// previously updated right away, now I am just checking if the 
+        // data is actually in the L1 or not (and having it being the MRU if so) -> PDF specification
 #ifdef DEBUG
             printf("dcache miss (%x) at %d\n", word_add, stat_cycles);
 #endif
-            int mshr_id = -1;
-            // 1 = req_from_memstage (MEM)
+            // if data is not in L1, handle the miss towards L2, e.g. search in L2
+            int mshr_id = -1; // dummy value to pass it to the probe of L2
             int r = l2_probe(pipe.l2cache, word_add, &mshr_id, 1);
             if (r == -1) {
                 return; // no free MSHR, retry next cycle
             }
+            // MSHR was free, L2 can "listen" to the request
             pipe.dcache_wait = 1;
             pipe.dcache_wait_addr = word_add & ~31;
             if (r == 1) {
-                // L2 HIT: 15 cycles total latency (stat_cycles + 14)
+                // L2 HIT -> 15 cycles total latency (stat_cycles + 14)
                 pipe.dcache_fill_cycle = stat_cycles + 14;
             } else {
-                // L2 MISS: variable latency, will be woken up by pipe_l2_cycle()
+                // L2 MISS -> pipe_l2_cycle() will update this once DRAM responds, leave
+                // it like this for now
                 pipe.dcache_fill_cycle = NO_CYCLE;
             }
             return;
@@ -808,7 +811,7 @@ void pipe_l2_cycle()
         mshr_t *curr_mshr = &pipe.l2cache->mshr[i];
         if (!curr_mshr->valid) continue; // do nothing if MSHR is not used
 
-#define MOCK_DRAM_LATENCY 249 // 249 cicli in DRAM (dal ciclo 5 al 254 del PDF)
+#define MOCK_DRAM_LATENCY 249 // 249 DRAM cycles (5 to 254)
         if (!curr_mshr->done)
         {
             curr_mshr->latency_cnt++;
