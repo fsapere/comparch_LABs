@@ -11,6 +11,7 @@
 
 #include "shell.h"
 #include "cache.h"
+#include "dram.h"
 
 /* Compile-time switches for Tasks 3 and 4. Both can be overridden with a -D
  * compiler flag (e.g. gcc ... -DMODEL_WRITEBACKS=0 -DREFRESH_INTERVAL=0).
@@ -117,7 +118,7 @@ typedef struct Pipe_State {
     l2_cache_t *l2cache;
     int dcache_mshr; // index for MSHR miss for MEM
     int icache_mshr; // index for MSHR miss for FETCH
-    
+    dram_t *dram;
 } Pipe_State;
 
 /* global variable -- pipeline state */

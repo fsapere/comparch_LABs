@@ -58,14 +58,15 @@ typedef struct {
 
 /* Memory request complete info  */
 typedef struct {
+    int         valid;             // 1 = active, 0 = free
     dram_cmd_t  type;              
     uint32_t    addr;              
     int         mshr_id;           
     int         req_from_memstage; 
     uint32_t    arrival_cycle;
-    uint32_t done_cycle;     
+    uint32_t    done_cycle;     
     uint64_t    req_id;
-    int scheduled;        
+    int         scheduled;        
 } dram_req_t;
 
 /* Complete DRAM system & Memory Controller structure */

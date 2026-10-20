@@ -48,7 +48,7 @@ void pipe_init()
     pipe.l2cache = l2_cache_new(512, 16, 32);
     pipe.icache_mshr = -1;
     pipe.dcache_mshr = -1;
-
+    pipe.dram = dram_new();
 }
 
 void pipe_cycle()
@@ -62,6 +62,7 @@ void pipe_cycle()
     printf("\n");
 #endif
     pipe_l2_cycle(); // advance L2 by one cycle
+    dram_cycle(pipe.dram, pipe.l2cache, stat_cycles); // advance DRAM by one cycle
     pipe_stage_wb();
     if (!RUN_BIT) return;
     pipe_stage_mem();
@@ -802,24 +803,22 @@ void pipe_stage_fetch()
     stat_inst_fetch++;
 }
 
-// This function describes how the L2 cache reacts to a cycle of pipe moving on
 void pipe_l2_cycle()
-{
+{// Simulate one cycle of L2 operation
     // linear search over the MSHR registers
     for (int i=0; i<16;i++)
     {
         mshr_t *curr_mshr = &pipe.l2cache->mshr[i];
         if (!curr_mshr->valid) continue; // do nothing if MSHR is not used
 
-#define MOCK_DRAM_LATENCY 249 // 249 DRAM cycles (5 to 254)
         if (!curr_mshr->done)
         {
             curr_mshr->latency_cnt++;
-            // Dopo 5 cicli (L2->MC) + 249 cicli (DRAM) = 254 cicli totali:
-            if (curr_mshr->latency_cnt == 5 + MOCK_DRAM_LATENCY) 
+            // wait 5(L2->MC)+x(DRAM) total cycles:
+            if (curr_mshr->latency_cnt == 5) 
             {
-                // La memoria risponde: imposta done=1 e resetta latency_cnt=0
-                l2_mem_fill_notify(pipe.l2cache, i);
+                dram_enqueue_read(pipe.dram, curr_mshr->addr, i, 
+                                  curr_mshr->req_from_memstage, stat_cycles);
             }
         } else {// reach here if done and handling miss
             curr_mshr->latency_cnt++; // increment counter for cycles
