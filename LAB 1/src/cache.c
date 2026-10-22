@@ -24,10 +24,13 @@ cache_t *cache_new(int sets, int ways, int block)
     c->ways = ways;
     c->log2sets = log2(sets);
     c->log2block = log2(block);
+    
 
     c->present = calloc(sizeof(uint8_t), sets * ways);
     c->tag = calloc(sizeof(uint32_t), sets * ways);
-
+    c->dirty=calloc(sizeof(uint32_t), sets*ways);
+    
+    // evicted was dirty and evicted addr are implicitly initialized to 0
     return c;
 }
 
@@ -48,6 +51,7 @@ void cache_destroy(cache_t *c)
     if (c) {
         free(c->present);
         free(c->tag);
+        free(c->dirty);
         free(c);
     }
 }
@@ -65,22 +69,26 @@ void l2_cache_destroy(l2_cache_t *l2)
 }
 
 int cache_probe(cache_t *c, uint32_t addr)
-{
+{// for writeback, do the same as baseline and simply reposition the dirty
+    // bits according to the new ordering of data after applying LRU
     uint32_t block = (addr >> c->log2block);
     uint32_t set = block & ((1UL << c->log2sets) - 1);
 
     uint8_t *setpres = &c->present[c->ways * set];
     uint32_t *settag = &c->tag[c->ways * set];
-
+    uint8_t *setdirty = &c->dirty[c->ways * set];
     /* on a hit, promote the block to the MRU position (way 0) */
     for (int i = 0; i < c->ways; i++) {
         if (setpres[i] && (settag[i] == block)) {
+            uint8_t hit_dirty = setdirty[i]; // save dirty status of what hit
             for (int j = i; j > 0; j--) {
                 setpres[j] = setpres[j-1];
                 settag[j] = settag[j-1];
+                setdirty[j] = setdirty[j-1]; // reorder dirty bits as all data fields
             }
             setpres[0] = 1;
             settag[0] = block;
+            setdirty[0] = hit_dirty;
             return 1;
         }
     }
@@ -135,6 +143,7 @@ int cache_update(cache_t *c, uint32_t addr)
 
     uint8_t *setpres = &c->present[c->ways * set];
     uint32_t *settag = &c->tag[c->ways * set];
+    uint8_t *setdirty = &c->dirty[c->ways * set];
 
     int hit = 0;
 
@@ -143,12 +152,16 @@ int cache_update(cache_t *c, uint32_t addr)
     for (i = 0; i < c->ways; i++) {
         if (setpres[i] && (settag[i] == block)) {
             int j;
+            uint8_t hit_dirty = setdirty[i]; // save dirty stat for block
             for (j = i; j > 0; j--) {
                 setpres[j] = setpres[j-1];
                 settag[j] = settag[j-1];
+                setdirty[j] = setdirty[j-1];
             }
             setpres[0] = 1;
             settag[0] = block;
+            setdirty[0] = hit_dirty;
+            c->evicted_wasdirty = 0; // hit, no eviction happened
             hit = 1;
             break;
         }
@@ -157,22 +170,37 @@ int cache_update(cache_t *c, uint32_t addr)
     }
 
     if (!hit) {
-        if (firstempty != -1) {
+        if (firstempty != -1) {//miss and first empty, no eviction
+            // and just add data
             for (i = firstempty; i > 0; i--) {
                 setpres[i] = setpres[i-1];
                 settag[i] = settag[i-1];
+                setdirty[i] = setdirty[i-1];
             }
             setpres[0] = 1;
             settag[0] = block;
+            setdirty[0] = 0;
+            c->evicted_wasdirty = 0; // not dirty and no evictions
             hit = 0;
         }
-        else {
-            for (i = c->ways - 1; i > 0; i--) {
+        else {// missed because set is full
+            int last = c->ways - 1;
+            if (setdirty[last])
+            {// if the last was dirty we need to track the eviction
+                c->evicted_wasdirty = 1;
+                c->evicted_addr = settag[last] << c->log2block;
+            }else
+            {
+                c->evicted_wasdirty = 0; // was evicted but not dirty
+            }
+            for (i = c-> ways - 1; i > 0; i--) {
                 setpres[i] = setpres[i - 1];
                 settag[i] = settag[i - 1];
+                setdirty[i] = setdirty[i-1];
             }
             setpres[0] = 1;
             settag[0] = block;
+            setdirty[0] = 0;
             hit = 0;
         }
     }
@@ -185,6 +213,25 @@ int cache_update(cache_t *c, uint32_t addr)
 #endif
 
     return hit;
+}
+
+
+int cache_mark_dirty(cache_t *c, uint32_t addr)
+{
+    uint32_t block = (addr >> c->log2block);
+    uint32_t set = block & ((1UL << c->log2sets) - 1);
+
+    uint8_t *setpres = &c->present[c->ways * set];
+    uint32_t *settag = &c->tag[c->ways * set];
+    uint8_t *setdirty = &c->dirty[c->ways * set];
+    // scan the ways of a set until you find the correct data, just update its dirty bit (MRU done in other funct)
+    for (int i = 0; i < c->ways; i++) {
+        if (setpres[i] && (settag[i] == block)) {
+            setdirty[i] = 1;
+            return 1; // 1 if you found data, 0 if no such data exists
+        }
+    }
+    return 0;
 }
 
 
@@ -201,6 +248,26 @@ int l2_cache_update(l2_cache_t *l2c, uint32_t addr, int mshr_id)
     }
     return hit;
 }
+
+// L1->L2 writeback function
+
+void l1_to_l2_writeback(l2_cache_t *l2c, uint32_t evicted_addr)
+{
+    // Task 3: Reset eviction tracking before probing L2.
+    // If the block hits in L2, no eviction occurs from L2 (evicted_wasdirty must stay 0).
+    // If it misses, cache_update() will set evicted_wasdirty to 1 only if a dirty block is actually evicted.
+    l2c->data->evicted_wasdirty = 0;
+
+    if (cache_probe(l2c->data, evicted_addr)) {
+        // L2 HIT -> probe handled MRU, update dirty bit
+        cache_mark_dirty(l2c->data, evicted_addr);
+    } else {
+        // L2 MISS -> update dirty bit and use pre existing update logic (from DRAM)
+        cache_update(l2c->data, evicted_addr);
+        cache_mark_dirty(l2c->data, evicted_addr);
+    }
+}
+
 
 // DRAM notifies L2 cache that that it served MEMREQ, 
 // reset cnt to 0 to track new 5 cycle latency

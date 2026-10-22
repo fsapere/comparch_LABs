@@ -167,20 +167,32 @@ void pipe_stage_mem()
     // check the status bit to see if we are waiting on a L1 miss
     if (pipe.dcache_wait) 
     {
-
         // check if we reached the fill cycle
         if (stat_cycles >= pipe.dcache_fill_cycle)
         {// L1 block is inserted in cache as soon as fill cycle is reached
             cache_update(pipe.dcache, pipe.dcache_wait_addr);
+            // if the update caused an eviction, handle the L1 to L2 writeback
+            if (MODEL_WRITEBACKS && pipe.dcache->evicted_wasdirty)
+            {
+                l1_to_l2_writeback(pipe.l2cache, pipe.dcache->evicted_addr);
+                // If L1 writeback caused an eviction of a dirty block from L2:
+                if (pipe.l2cache->data->evicted_wasdirty)
+                {
+                    dram_enqueue_write(pipe.dram, pipe.l2cache->data->evicted_addr, stat_cycles + 5);
+                }
+            }
             pipe.dcache_wait = 0;
             pipe.dcache_fill_cycle = NO_CYCLE; // reset status flag for misses
         }
+
 
 #ifdef DEBUG
         printf("dcache fill (%x) at %d\n", pipe.dcache_wait_addr, stat_cycles);
 #endif
         return;
     }
+
+
 
     /* if there is no instruction in this pipeline stage, we are done */
     if (!pipe.mem_op)
@@ -193,8 +205,7 @@ void pipe_stage_mem()
     if (op->is_mem) {
         uint32_t word_add = op->mem_addr & ~3;
         if (!cache_probe(pipe.dcache, word_add)) 
-        {// previously updated right away, now I am just checking if the 
-        // data is actually in the L1 or not (and having it being the MRU if so) -> PDF specification
+        {// if you enter here it is a miss
 #ifdef DEBUG
             printf("dcache miss (%x) at %d\n", word_add, stat_cycles);
 #endif
@@ -202,7 +213,7 @@ void pipe_stage_mem()
             int mshr_id = -1; // dummy value to pass it to the probe of L2
             int r = l2_probe(pipe.l2cache, word_add, &mshr_id, 1);
             if (r == -1) {
-                return; // no free MSHR, retry next cycle
+                return; // no free MSHR, retry next cycle and stall for now
             }
             // MSHR was free, L2 can "listen" to the request
             pipe.dcache_wait = 1;
@@ -211,8 +222,7 @@ void pipe_stage_mem()
                 // L2 HIT -> 15 cycles total latency (stat_cycles + 14)
                 pipe.dcache_fill_cycle = stat_cycles + 14;
             } else {
-                // L2 MISS -> pipe_l2_cycle() will update this once DRAM responds, leave
-                // it like this for now
+                // L2 MISS -> pipe_l2_cycle() will update this once DRAM responds, can't know right away
                 pipe.dcache_fill_cycle = NO_CYCLE;
             }
             return;
@@ -302,6 +312,13 @@ void pipe_stage_mem()
             mem_write_32(op->mem_addr & ~3, val);
             break;
     }
+
+    // once we are done analyzing a read, analyze the WRITE -> CPU misses L1 the writeback happens immediately and data becomes dirty
+    if (MODEL_WRITEBACKS && op->mem_write)
+    {
+        cache_mark_dirty(pipe.dcache, op->mem_addr);
+    }
+
 
     /* clear stage input and transfer to next stage */
     pipe.mem_op = NULL;
@@ -828,6 +845,11 @@ void pipe_l2_cycle()
                 // insert data from DRAM into L2 since miss is now over, data
                 // has been fetched from DRAM (+ free up the MSHR)
                 l2_cache_update(pipe.l2cache, addr, i);
+                // If L2 cache insertion caused an eviction of a dirty block from L2:
+                if (MODEL_WRITEBACKS && pipe.l2cache->data->evicted_wasdirty)
+                {
+                    dram_enqueue_write(pipe.dram, pipe.l2cache->data->evicted_addr, stat_cycles + 5);
+                }
                 // notify L1 caches (based on who generated the miss) that the data is now
                 // ready -> fill cycle counter gets reset, so that when pipe sees this it
                 // proceeds with the instructions that were waiting on this

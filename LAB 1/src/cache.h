@@ -18,7 +18,11 @@ typedef struct
     int log2block;
 
     uint8_t *present;
+    uint8_t *dirty; // track dirty bits
     uint32_t *tag;
+    // track status of last eviction, use after update (eviction happened? was it dirty?)
+    int evicted_wasdirty; // 0 for no eviction or not dirty, 1 otherwise
+    uint32_t evicted_addr;
 } cache_t;
 
 
@@ -63,5 +67,13 @@ void l2_cycle(l2_cache_t *l2c);
 
 // Function to refresh the L2  latency counter when the req has been served by DRAM
 void l2_mem_fill_notify(l2_cache_t *l2c, int mshr_id);
+
+// Function to mark a cache block as dirty
+int cache_mark_dirty(cache_t *c, uint32_t addr); 
+
+// Function to writeback L1->L2
+void l1_to_l2_writeback(l2_cache_t *l2c, uint32_t evicted_addr);
+
+
 #endif
 

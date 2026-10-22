@@ -77,6 +77,7 @@ typedef struct {
     dram_req_t  queue[DRAM_REQ_QUEUE_SIZE];
     int         num_reqs;           // number of req currently in queue
     uint64_t    next_req_id;        // serialization of multiple access in same cycle
+    uint32_t refresh_k; // how many refreshes already happened
 } dram_t;
 
 /* Create/destroy a DRAM */
@@ -86,6 +87,9 @@ void    dram_destroy(dram_t *d);
 /* Enqueue a read request from L2 (called 5 cycles after L2 miss) */
 void dram_enqueue_read(dram_t *d, uint32_t addr, int mshr_id,
                        int req_from_memstage, uint32_t now);
+
+/* Enqueue a write request from L2 (arrives after 5 cycles of latency) */
+void dram_enqueue_write(dram_t *d, uint32_t addr, uint32_t arrival_cycle);
 
 /* Advance DRAM state by 1 cycle: check completions, schedule pending, clear past slot */
 void dram_cycle(dram_t *d, l2_cache_t *l2c, uint32_t now);

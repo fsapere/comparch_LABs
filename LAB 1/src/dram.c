@@ -4,6 +4,7 @@
 
 #include "cache.h"
 #include "dram.h"
+#include "pipe.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -85,9 +86,48 @@ int dram_is_schedulable(dram_t *d, dram_req_t *r, uint32_t now)
         return 0;
     }
 
+    // bank blocking: if the bank has a pending refresh request, block the scheduling
+    // of any command to that bank
+    if (r->type != CMD_REFRESH) {
+        for (int i = 0; i < DRAM_REQ_QUEUE_SIZE; i++) {
+            if (d->queue[i].valid && !d->queue[i].scheduled && 
+                d->queue[i].type == CMD_REFRESH && DRAM_BANK(d->queue[i].addr) == bank) 
+                {
+                    return 0; // not schedulable
+                }
+        }
+    }
+
     // read the row buffer status
     rb_status_t status = dram_rb_status(d, r);
+    // check schedulability N cycles from now of the REFRESH commands
+    if (r->type == CMD_REFRESH) {
+        if (d->banks[bank].open_row == -1) {
+            // CLOSED RB: ACT 'now'+4, PRE 'now + 100' for 4 cycles
+            if (!dram_bus_isfree(d->cmd_bus, now, DRAM_CMD_CYCLES)) {
+                return 0;
+            }
+            if (!dram_bus_isfree(d->cmd_bus, now + 100, DRAM_CMD_CYCLES)) {
+                return 0;
+            }
+            return 1;
+        } else {
+            // OPEN RB: PRE 'now', ACT 'now + 100', PRE 'now + 200'
+            if (!dram_bus_isfree(d->cmd_bus, now, DRAM_CMD_CYCLES)) {
+                return 0;
+            }
+            if (!dram_bus_isfree(d->cmd_bus, now + 100, DRAM_CMD_CYCLES)) {
+                return 0;
+            }
+            if (!dram_bus_isfree(d->cmd_bus, now + 200, DRAM_CMD_CYCLES)) {
+                return 0;
+            }
+            return 1;
+        }
+    }
 
+
+    // check schedulability N cycles from now of the R/W commands
     if (status == RB_HIT) {
         // READ at 'now' (4 cycles on cmd bus)
         if (!dram_bus_isfree(d->cmd_bus, now, DRAM_CMD_CYCLES)) {
@@ -139,49 +179,80 @@ void dram_schedule(dram_t *d, dram_req_t *r, uint32_t now)
     int bank = DRAM_BANK(r->addr);
     int row  = DRAM_ROW(r->addr);
     rb_status_t status = dram_rb_status(d, r);
+    dram_cmd_t dram_cmd = r->type; // CMD_READ/WRITE/REFRESH
 
-    if (status == RB_HIT) {
+    if(dram_cmd == CMD_REFRESH)
+    {// apply same policy you used to check for schedulability, now to reserve slots on the bus
+        if (status == RB_MISS) 
+        {// row buffer closed, ACT now, PRE now + 100
+            dram_bus_reserve(d->cmd_bus, now, DRAM_CMD_CYCLES, CMD_ACT, -1, bank);
+            dram_bus_reserve(d->cmd_bus, now + 100, DRAM_CMD_CYCLES, CMD_PRE, -1, bank);
+            d->banks[bank].free_at = now + 200;
+            r->done_cycle = now + 200 - 1;
+        } else 
+        {// rb open PRE now, ACT now + 100, PRE now + 200
+            dram_bus_reserve(d->cmd_bus, now, DRAM_CMD_CYCLES, CMD_PRE, -1, bank);
+            dram_bus_reserve(d->cmd_bus, now + 100, DRAM_CMD_CYCLES, CMD_ACT, -1, bank);
+            dram_bus_reserve(d->cmd_bus, now + 200, DRAM_CMD_CYCLES, CMD_PRE, -1, bank);
+            d->banks[bank].free_at = now + 300;
+            r->done_cycle = now + 300 - 1;
+        }
+        d->banks[bank].open_row = -1; // row buffer sempre chiuso dopo refresh!
+        r->scheduled = 1;
+        return;
+    }
+
+    if (status == RB_HIT) 
+    {
         // reserve slots both on data and cmd bus according to specs of the PDF based on RB
-        dram_bus_reserve(d->cmd_bus, now, DRAM_CMD_CYCLES, CMD_READ, r->mshr_id, bank);
-        dram_bus_reserve(d->data_bus, now + 100, DRAM_DATA_CYCLES, CMD_READ, r->mshr_id, bank);
+        dram_bus_reserve(d->cmd_bus, now, DRAM_CMD_CYCLES, dram_cmd, r->mshr_id, bank);
+        dram_bus_reserve(d->data_bus, now + 100, DRAM_DATA_CYCLES, dram_cmd, r->mshr_id, bank);
         // set the bank as busy for the next 100 cycles
         d->banks[bank].free_at = now + 100;
         // update when request will be done
         r->done_cycle = now + 100 + DRAM_DATA_CYCLES - 1;
-    } else if (status == RB_MISS) {
+    } else if (status == RB_MISS) 
+    {
         dram_bus_reserve(d->cmd_bus, now, DRAM_CMD_CYCLES, CMD_ACT, r->mshr_id, bank);
-        dram_bus_reserve(d->cmd_bus, now + 100, DRAM_CMD_CYCLES, CMD_READ, r->mshr_id, bank);
-        dram_bus_reserve(d->data_bus, now + 200, DRAM_DATA_CYCLES, CMD_READ, r->mshr_id, bank);
+        dram_bus_reserve(d->cmd_bus, now + 100, DRAM_CMD_CYCLES, dram_cmd, r->mshr_id, bank);
+        dram_bus_reserve(d->data_bus, now + 200, DRAM_DATA_CYCLES, dram_cmd, r->mshr_id, bank);
         d->banks[bank].free_at = now + 200;
         r->done_cycle = now + 200 + DRAM_DATA_CYCLES - 1;
-    } else { 
+    } else 
+    { 
         dram_bus_reserve(d->cmd_bus, now, DRAM_CMD_CYCLES, CMD_PRE, r->mshr_id, bank);
         dram_bus_reserve(d->cmd_bus, now + 100, DRAM_CMD_CYCLES, CMD_ACT, r->mshr_id, bank);
-        dram_bus_reserve(d->cmd_bus, now + 200, DRAM_CMD_CYCLES, CMD_READ, r->mshr_id, bank);
-        dram_bus_reserve(d->data_bus, now + 300, DRAM_DATA_CYCLES, CMD_READ, r->mshr_id, bank);
+        dram_bus_reserve(d->cmd_bus, now + 200, DRAM_CMD_CYCLES, dram_cmd, r->mshr_id, bank);
+        dram_bus_reserve(d->data_bus, now + 300, DRAM_DATA_CYCLES, dram_cmd, r->mshr_id, bank);
         d->banks[bank].free_at = now + 300;
         r->done_cycle = now + 300 + DRAM_DATA_CYCLES - 1;
     }
 
     // Open-Row Policy: row is now open in row buffer
     d->banks[bank].open_row = row;
-    r->scheduled = 1;
+    if (r->type == CMD_WRITE) 
+    {
+        // Spec: A write request leaves the request queue when it is scheduled
+        r->valid = 0;
+    } else {
+        r->scheduled = 1;
+    }
 }
 
 
-// add a read to the request queue
-void dram_enqueue_read(dram_t *d, uint32_t addr, int mshr_id,
-                       int req_from_memstage, uint32_t now)
+// unified queue insertion helper
+static void dram_enqueue(dram_t *d, dram_cmd_t type, uint32_t addr,
+                         int mshr_id, int req_from_memstage, uint32_t arrival_cycle)
 {
     for (int i = 0; i < DRAM_REQ_QUEUE_SIZE; i++) {
         if (!d->queue[i].valid) {
             dram_req_t *req = &d->queue[i];
             req->valid             = 1;
-            req->type              = CMD_READ;
+            req->type              = type;
             req->addr              = addr;
             req->mshr_id           = mshr_id;
             req->req_from_memstage = req_from_memstage;
-            req->arrival_cycle     = now;
+            req->arrival_cycle     = arrival_cycle;
             req->req_id            = d->next_req_id++; // tie-break for multiple requests in same cycle
             req->scheduled         = 0;
             req->done_cycle        = 0;
@@ -190,50 +261,99 @@ void dram_enqueue_read(dram_t *d, uint32_t addr, int mshr_id,
     }
 }
 
-// Compare two candidates according to FR-FCFS policy (PDF Section 5)
-// Returns 1 if 'cand' has higher priority than 'best', 0 otherwise
-static int dram_req_better(dram_t *d, dram_req_t *cand, dram_req_t *best)
+// add a read to the request queue
+void dram_enqueue_read(dram_t *d, uint32_t addr, int mshr_id,
+                       int req_from_memstage, uint32_t now)
 {
-    // Rule 1: Row buffer hits prioritized over others
+    dram_enqueue(d, CMD_READ, addr, mshr_id, req_from_memstage, now);
+}
+
+// add a write to the request queue (from L2 writeback)
+void dram_enqueue_write(dram_t *d, uint32_t addr, uint32_t arrival_cycle)
+{
+    dram_enqueue(d, CMD_WRITE, addr, -1, 1, arrival_cycle);
+}
+
+// add a refresgh to the request queue
+void dram_enqueue_refresh(dram_t *d, uint32_t addr, uint32_t now)
+{
+    dram_enqueue(d, CMD_REFRESH, addr, -1, 0, now);
+}
+
+
+// FR-FCFS policy comparison for two candiate instructions (1 if cand higher priority than current best, 0 otherwise)
+static int dram_req_better(dram_t *d, dram_req_t *cand, dram_req_t *best)
+{// refreshes must be prioritized over everything else
+    if (cand->type == CMD_REFRESH && best->type != CMD_REFRESH) {
+        return 1; // cand is refresh, best isn't, so cand wins
+    }
+    if (cand->type != CMD_REFRESH && best->type == CMD_REFRESH) {
+        return 0;
+    }
+    // if both are refreshes in the queue, FIFO
+    if (cand->type == CMD_REFRESH && best->type == CMD_REFRESH) {
+        return cand->req_id < best->req_id;
+    }
+
+    // check row buffer hits
     int cand_hit = (dram_rb_status(d, cand) == RB_HIT);
     int best_hit = (dram_rb_status(d, best) == RB_HIT);
     if (cand_hit != best_hit) {
         return cand_hit > best_hit;
     }
 
-    // Rule 2: Earlier arrival cycle
+    // check arrival cycle
     if (cand->arrival_cycle != best->arrival_cycle) {
         return cand->arrival_cycle < best->arrival_cycle;
     }
 
-    // Rule 3: Memory stage prioritized over fetch stage
+    // Rule 3: read requests prioritized over write requests
+    if ((cand->type == CMD_READ) != (best->type == CMD_READ)) {
+        return cand->type == CMD_READ;
+    }
+
+    // Rule 4: MEM stage higher priority than FETCH
     if (cand->req_from_memstage != best->req_from_memstage) {
         return cand->req_from_memstage > best->req_from_memstage;
     }
 
-    // Rule 5: Tie-break on creation order (lower req_id)
+    // last tie break, id request (when were they created within the same cycle)
     return cand->req_id < best->req_id;
 }
 
 // Simulate one cycle of DRAM operation
 void dram_cycle(dram_t *d, l2_cache_t *l2c, uint32_t now)
 {
-    // 1. Completion: Notify L2 if data transfer completed at cycle 'now', then clear
+    // notify L2 of completed transfer and clear
     for (int i = 0; i < DRAM_REQ_QUEUE_SIZE; i++) {
         dram_req_t *req = &d->queue[i];
         if (!req->valid) continue;
-
-        if (req->scheduled && req->done_cycle == now) {
-            l2_mem_fill_notify(l2c, req->mshr_id);
-            req->valid = 0; // cleared without copying or shifting
+        if (req->scheduled && req->done_cycle == now) {// can be a read or a ref, writes are
+        // removed from the queue as soon as they are scheduled, while REF/RD once completed
+            if(req->type == CMD_READ)
+            {// it is a read, notify the l2 by freeing the mshr
+                l2_mem_fill_notify(l2c, req->mshr_id);
+            }// for both reads and refreshes, clear the slot in the queue once done
+            req->valid = 0;
         }
     }
 
-    // 2. Scheduling: Find the best schedulable request using FR-FCFS
+    // periodically inject refresh operations in the queue
+#if REFRESH_INTERVAL > 0
+    if (now >= REFRESH_INTERVAL && (now % REFRESH_INTERVAL == 0)) {
+        uint32_t k = d->refresh_k++;
+        int bank = k % DRAM_NUM_BANKS;
+        int row  = (k / DRAM_NUM_BANKS) % 65536;
+        uint32_t addr = (row << 16) | (bank << 5);
+        dram_enqueue_refresh(d, addr, now);
+    }
+#endif
+    // FR-FCFS scheduling scanning the queue
     int best_idx = -1;
     for (int i = 0; i < DRAM_REQ_QUEUE_SIZE; i++) {
         dram_req_t *req = &d->queue[i];
         if (!req->valid || req->scheduled) continue;
+        if (now < req->arrival_cycle) continue; // not arrived at controller yet
 
         if (!dram_is_schedulable(d, req, now)) continue;
 
@@ -242,12 +362,12 @@ void dram_cycle(dram_t *d, l2_cache_t *l2c, uint32_t now)
         }
     }
 
-    // If a request is schedulable and won the FR-FCFS arbitration, schedule it!
+    // If a request is schedulable and won the FR-FCFS arbitration, schedule it
     if (best_idx != -1) {
         dram_schedule(d, &d->queue[best_idx], now);
     }
 
-    // 3. Clear ring buffer slots of the elapsed cycle 'now'
+    // clear bus slots at the now cycle
     d->cmd_bus[now % DRAM_BUS_BUFFER_LEN] = (bus_slot_t){ CMD_FREE, -1, -1 };
     d->data_bus[now % DRAM_BUS_BUFFER_LEN] = (bus_slot_t){ CMD_FREE, -1, -1 };
 }
