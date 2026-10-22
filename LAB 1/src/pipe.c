@@ -68,7 +68,7 @@ void pipe_cycle()
     pipe_stage_mem();
     pipe_stage_execute();
 
-    /* Fix 1.1: If execute stage scheduled a branch recovery to a different block,
+    /* If execute stage scheduled a branch recovery to a different block,
      * immediately cancel the pending L1 icache miss before it can be filled into L1 icache. */
     if (pipe.branch_recover) {
         if (pipe.icache_wait && ((pipe.branch_dest >> 5) != (pipe.icache_wait_addr >> 5))) {
