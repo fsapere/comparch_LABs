@@ -118,26 +118,42 @@ int l2_probe(l2_cache_t *l2c, uint32_t addr, int* mshr_id, int req_from_memstage
     if(free_mshr == -1) return -1; // can't probe if no MSHR is free
     
     // if MSHR is free, check hit/miss
-    if(!cache_probe(l2c->data, addr))
-    {// miss happened, allocate MSHR
-        l2c->mshr[free_mshr].valid=1;
-        l2c->mshr[free_mshr].done=0;
-        l2c->mshr[free_mshr].addr=addr & ~31; // block address
-        l2c->mshr[free_mshr].latency_cnt = 0; // miss triggered the cycle wait
-        // before returning, save the MSHR id of the miss
-        l2c->mshr[free_mshr].req_from_memstage = req_from_memstage;
-        if (mshr_id) 
-        {
-            *mshr_id = free_mshr; // save index of first mshr to return it
-        }
+    if (cache_probe(l2c->data, addr)) {
+        return 1; // return 1 if you hit
+    }
 
-        return 0; // return 0 if you miss 
-    } // otherwise  do nothing 
-    return 1; // return 1 if you hit
+    // Miss in L2
+    uint32_t block_addr = addr & ~31U;
+
+    // Check if there is already an in-flight MSHR for this block
+    for (int i = 0; i < 16; i++) {
+        if (l2c->mshr[i].valid && l2c->mshr[i].addr == block_addr) {
+            if (mshr_id) {
+                *mshr_id = i;
+            }
+            return 0; // miss, but hooked to existing in-flight MSHR
+        }
+    }
+
+    // Allocate free MSHR
+    l2c->mshr[free_mshr].valid = 1;
+    l2c->mshr[free_mshr].done = 0;
+    l2c->mshr[free_mshr].addr = block_addr;
+    l2c->mshr[free_mshr].latency_cnt = 0;
+    l2c->mshr[free_mshr].req_from_memstage = req_from_memstage;
+    if (mshr_id) 
+    {
+        *mshr_id = free_mshr;
+    }
+
+    return 0; // return 0 if you miss
 }
 
 int cache_update(cache_t *c, uint32_t addr)
 {
+    c->evicted_wasdirty = 0;
+    c->evicted_addr = 0;
+
     uint32_t block = (addr >> c->log2block);
     uint32_t set = block & ((1UL << c->log2sets) - 1);
 
@@ -238,6 +254,9 @@ int cache_mark_dirty(cache_t *c, uint32_t addr)
 // L2 cache update and MSHR handling
 int l2_cache_update(l2_cache_t *l2c, uint32_t addr, int mshr_id)
 {
+    l2c->data->evicted_wasdirty = 0;
+    l2c->data->evicted_addr = 0;
+
     // check if we hit on the L2 cache or not, update LRU and insert block in L2
     int hit = cache_update(l2c->data, addr);
 
@@ -257,10 +276,14 @@ void l1_to_l2_writeback(l2_cache_t *l2c, uint32_t evicted_addr)
     // If the block hits in L2, no eviction occurs from L2 (evicted_wasdirty must stay 0).
     // If it misses, cache_update() will set evicted_wasdirty to 1 only if a dirty block is actually evicted.
     l2c->data->evicted_wasdirty = 0;
+    l2c->data->evicted_addr = 0;
 
     if (cache_probe(l2c->data, evicted_addr)) {
-        // L2 HIT -> probe handled MRU, update dirty bit
+        // L2 HIT -> promote to MRU using cache_update, mark dirty, ensure evicted_wasdirty is 0
+        cache_update(l2c->data, evicted_addr);
         cache_mark_dirty(l2c->data, evicted_addr);
+        l2c->data->evicted_wasdirty = 0;
+        l2c->data->evicted_addr = 0;
     } else {
         // L2 MISS -> update dirty bit and use pre existing update logic (from DRAM)
         cache_update(l2c->data, evicted_addr);

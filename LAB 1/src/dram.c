@@ -35,10 +35,11 @@ void dram_destroy(dram_t *d)
 
 int dram_bus_isfree(bus_slot_t *bus, uint32_t start, int len)
 {
-    for(int i=0;i<len;i++)
+    for (int i = 0; i < len; i++)
     {
-        int idx = (start + i) % DRAM_BUS_BUFFER_LEN; // circular buffer
-        if(bus[idx].cmd != CMD_FREE)
+        uint32_t cycle = start + i;
+        int idx = cycle % DRAM_BUS_BUFFER_LEN; // circular buffer
+        if (bus[idx].busy_cycle == cycle + 1)
         {
             return 0;
         }
@@ -53,10 +54,12 @@ void dram_bus_reserve(bus_slot_t *bus, uint32_t start, int len,
 {
     for (int i = 0; i < len; i++)
     {
-        int idx = (start + i) % DRAM_BUS_BUFFER_LEN;
-        bus[idx].cmd     = cmd;
-        bus[idx].mshr_id = mshr_id;
-        bus[idx].bank    = bank;
+        uint32_t cycle = start + i;
+        int idx = cycle % DRAM_BUS_BUFFER_LEN;
+        bus[idx].busy_cycle = cycle + 1;
+        bus[idx].cmd        = cmd;
+        bus[idx].mshr_id    = mshr_id;
+        bus[idx].bank       = bank;
     }
 }
 
@@ -80,30 +83,29 @@ rb_status_t dram_rb_status(dram_t *d, dram_req_t *r)
 // policy from PDF -> based on RB status, check if you can occupy bus in M cycles for a duration of N
 int dram_is_schedulable(dram_t *d, dram_req_t *r, uint32_t now)
 {
+    if (!r->valid) return 0;
+    if (now < r->arrival_cycle) return 0;
     int bank = DRAM_BANK(r->addr);
-    // if the bank is not free now, we cannot schedule anything
-    if (now < d->banks[bank].free_at) {
-        return 0;
-    }
+    if (now < d->banks[bank].free_at) return 0;
 
     // bank blocking: if the bank has a pending refresh request, block the scheduling
     // of any command to that bank
     if (r->type != CMD_REFRESH) {
         for (int i = 0; i < DRAM_REQ_QUEUE_SIZE; i++) {
-            if (d->queue[i].valid && !d->queue[i].scheduled && 
-                d->queue[i].type == CMD_REFRESH && DRAM_BANK(d->queue[i].addr) == bank) 
-                {
-                    return 0; // not schedulable
-                }
+            if (d->queue[i].valid &&
+                d->queue[i].type == CMD_REFRESH &&
+                DRAM_BANK(d->queue[i].addr) == bank &&
+                now >= d->queue[i].arrival_cycle)
+            {
+                return 0; // not schedulable
+            }
         }
     }
 
-    // read the row buffer status
-    rb_status_t status = dram_rb_status(d, r);
     // check schedulability N cycles from now of the REFRESH commands
     if (r->type == CMD_REFRESH) {
         if (d->banks[bank].open_row == -1) {
-            // CLOSED RB: ACT 'now'+4, PRE 'now + 100' for 4 cycles
+            // Closed row buffer: ACT at now, PRE at now + 100 (no data bus)
             if (!dram_bus_isfree(d->cmd_bus, now, DRAM_CMD_CYCLES)) {
                 return 0;
             }
@@ -112,7 +114,7 @@ int dram_is_schedulable(dram_t *d, dram_req_t *r, uint32_t now)
             }
             return 1;
         } else {
-            // OPEN RB: PRE 'now', ACT 'now + 100', PRE 'now + 200'
+            // Open row buffer (ANY row, even if open_row == r->row): PRE at now, ACT at now + 100, PRE at now + 200
             if (!dram_bus_isfree(d->cmd_bus, now, DRAM_CMD_CYCLES)) {
                 return 0;
             }
@@ -126,10 +128,12 @@ int dram_is_schedulable(dram_t *d, dram_req_t *r, uint32_t now)
         }
     }
 
+    // read the row buffer status
+    rb_status_t status = dram_rb_status(d, r);
 
     // check schedulability N cycles from now of the R/W commands
     if (status == RB_HIT) {
-        // READ at 'now' (4 cycles on cmd bus)
+        // READ/WRITE at 'now' (4 cycles on cmd bus)
         if (!dram_bus_isfree(d->cmd_bus, now, DRAM_CMD_CYCLES)) {
             return 0;
         }
@@ -143,7 +147,7 @@ int dram_is_schedulable(dram_t *d, dram_req_t *r, uint32_t now)
         if (!dram_bus_isfree(d->cmd_bus, now, DRAM_CMD_CYCLES)) {
             return 0;
         }
-        // READ at 'now + 100' (4 cycles on cmd bus)
+        // READ/WRITE at 'now + 100' (4 cycles on cmd bus)
         if (!dram_bus_isfree(d->cmd_bus, now + 100, DRAM_CMD_CYCLES)) {
             return 0;
         }
@@ -161,7 +165,7 @@ int dram_is_schedulable(dram_t *d, dram_req_t *r, uint32_t now)
         if (!dram_bus_isfree(d->cmd_bus, now + 100, DRAM_CMD_CYCLES)) {
             return 0;
         }
-        // READ at 'now + 200' (4 cycles on cmd bus)
+        // READ/WRITE at 'now + 200' (4 cycles on cmd bus)
         if (!dram_bus_isfree(d->cmd_bus, now + 200, DRAM_CMD_CYCLES)) {
             return 0;
         }
@@ -183,7 +187,7 @@ void dram_schedule(dram_t *d, dram_req_t *r, uint32_t now)
 
     if(dram_cmd == CMD_REFRESH)
     {// apply same policy you used to check for schedulability, now to reserve slots on the bus
-        if (status == RB_MISS) 
+        if (d->banks[bank].open_row == -1) 
         {// row buffer closed, ACT now, PRE now + 100
             dram_bus_reserve(d->cmd_bus, now, DRAM_CMD_CYCLES, CMD_ACT, -1, bank);
             dram_bus_reserve(d->cmd_bus, now + 100, DRAM_CMD_CYCLES, CMD_PRE, -1, bank);
@@ -250,6 +254,8 @@ static void dram_enqueue(dram_t *d, dram_cmd_t type, uint32_t addr,
             req->valid             = 1;
             req->type              = type;
             req->addr              = addr;
+            req->bank              = DRAM_BANK(addr);
+            req->row               = DRAM_ROW(addr);
             req->mshr_id           = mshr_id;
             req->req_from_memstage = req_from_memstage;
             req->arrival_cycle     = arrival_cycle;
@@ -282,7 +288,7 @@ void dram_enqueue_refresh(dram_t *d, uint32_t addr, uint32_t now)
 
 
 // FR-FCFS policy comparison for two candiate instructions (1 if cand higher priority than current best, 0 otherwise)
-static int dram_req_better(dram_t *d, dram_req_t *cand, dram_req_t *best)
+int dram_req_better(dram_t *d, dram_req_t *cand, dram_req_t *best)
 {// refreshes must be prioritized over everything else
     if (cand->type == CMD_REFRESH && best->type != CMD_REFRESH) {
         return 1; // cand is refresh, best isn't, so cand wins
@@ -368,6 +374,6 @@ void dram_cycle(dram_t *d, l2_cache_t *l2c, uint32_t now)
     }
 
     // clear bus slots at the now cycle
-    d->cmd_bus[now % DRAM_BUS_BUFFER_LEN] = (bus_slot_t){ CMD_FREE, -1, -1 };
-    d->data_bus[now % DRAM_BUS_BUFFER_LEN] = (bus_slot_t){ CMD_FREE, -1, -1 };
+    d->cmd_bus[now % DRAM_BUS_BUFFER_LEN] = (bus_slot_t){ 0, CMD_FREE, -1, -1 };
+    d->data_bus[now % DRAM_BUS_BUFFER_LEN] = (bus_slot_t){ 0, CMD_FREE, -1, -1 };
 }

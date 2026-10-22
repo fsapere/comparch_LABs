@@ -15,9 +15,10 @@
 #define DRAM_DATA_CYCLES    50     
 #define DRAM_MAX_CMDS       3
 // number of planned commands to access a row in case of row buff conflict (PRE (disconnect prev), ACT+R/W) 
-#define DRAM_BUS_BUFFER_LEN        512
+#define DRAM_BUS_BUFFER_LEN        2048
 // to track if bus is occupied over the next N cycles
-#define DRAM_REQ_QUEUE_SIZE 64     
+#define DRAM_QUEUE_SIZE            2048
+#define DRAM_REQ_QUEUE_SIZE        DRAM_QUEUE_SIZE
 // Size of the queue that tracks which commands should be issued
 
 /* Address Decoding ([7:5] bank, [31:16] row) */
@@ -37,9 +38,10 @@ typedef enum {
 
 /* Info for each request on the bus */
 typedef struct {
+    uint32_t   busy_cycle; // start_cycle + i + 1 (0 = free / unreserved)
     dram_cmd_t cmd;    
-    int mshr_id;       // who issued the req from L2?
-    int bank;          // which bank is the req going to?
+    int        mshr_id;    // who issued the req from L2?
+    int        bank;       // which bank is the req going to?
 } bus_slot_t;
 
 /* FCFS priority: Status & required commands  */
@@ -61,6 +63,8 @@ typedef struct {
     int         valid;             // 1 = active, 0 = free
     dram_cmd_t  type;              
     uint32_t    addr;              
+    int         bank;              // [7:5] of addr
+    int         row;               // [31:16] of addr
     int         mshr_id;           
     int         req_from_memstage; 
     uint32_t    arrival_cycle;
@@ -91,6 +95,9 @@ void dram_enqueue_read(dram_t *d, uint32_t addr, int mshr_id,
 /* Enqueue a write request from L2 (arrives after 5 cycles of latency) */
 void dram_enqueue_write(dram_t *d, uint32_t addr, uint32_t arrival_cycle);
 
+/* Enqueue a refresh request */
+void dram_enqueue_refresh(dram_t *d, uint32_t addr, uint32_t now);
+
 /* Advance DRAM state by 1 cycle: check completions, schedule pending, clear past slot */
 void dram_cycle(dram_t *d, l2_cache_t *l2c, uint32_t now);
 
@@ -98,6 +105,7 @@ void dram_cycle(dram_t *d, l2_cache_t *l2c, uint32_t now);
 rb_status_t dram_rb_status(dram_t *d, dram_req_t *r);
 int dram_is_schedulable(dram_t *d, dram_req_t *r, uint32_t now);
 void dram_schedule(dram_t *d, dram_req_t *r, uint32_t now);
+int  dram_req_better(dram_t *d, dram_req_t *cand, dram_req_t *best);
 
 /* Bus check and reservation */
 int  dram_bus_isfree(bus_slot_t *bus, uint32_t start, int len);

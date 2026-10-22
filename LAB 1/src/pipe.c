@@ -67,6 +67,16 @@ void pipe_cycle()
     if (!RUN_BIT) return;
     pipe_stage_mem();
     pipe_stage_execute();
+
+    /* Fix 1.1: If execute stage scheduled a branch recovery to a different block,
+     * immediately cancel the pending L1 icache miss before it can be filled into L1 icache. */
+    if (pipe.branch_recover) {
+        if (pipe.icache_wait && ((pipe.branch_dest >> 5) != (pipe.icache_wait_addr >> 5))) {
+            pipe.icache_wait = 0;
+            pipe.icache_fill_cycle = NO_CYCLE;
+        }
+    }
+
     pipe_stage_decode();
     pipe_stage_fetch();
 
@@ -74,12 +84,11 @@ void pipe_cycle()
     if (pipe.branch_recover) {
         /* cancel a pending icache miss if the redirect leaves its block */
         if (pipe.icache_wait &&
-                (pipe.branch_dest & ~31) != (pipe.icache_wait_addr))
-                {
-                    // same condition as before, only updating different flags 
-                    pipe.icache_wait = 0;
-                    pipe.icache_fill_cycle = NO_CYCLE;
-                } 
+            ((pipe.branch_dest >> 5) != (pipe.icache_wait_addr >> 5)))
+        {
+            pipe.icache_wait = 0;
+            pipe.icache_fill_cycle = NO_CYCLE;
+        } 
 
 
 
@@ -643,6 +652,7 @@ void pipe_stage_decode()
     uint32_t imm16 = (op->instruction >> 0) & 0xFFFF;
     uint32_t se_imm16 = imm16 | ((imm16 & 0x8000) ? 0xFFFF8000 : 0);
     uint32_t targ = (op->instruction & ((1UL << 26) - 1)) << 2;
+    (void)funct1;
 
     op->opcode = opcode;
     op->imm16 = imm16;
@@ -764,17 +774,31 @@ void pipe_stage_fetch()
     if (pipe.decode_op != NULL)
         return;
 
-    /* if we are stalling on an icache miss, wait for fill cycle */
-    // same conceptual logic as MEM stage, but this time in FETCH for INSTRUCTIONS
-    if (pipe.icache_wait) {
-        if (stat_cycles >= pipe.icache_fill_cycle) {
-            /* insert into L1 cache unless a redirect in this cycle canceled the miss */
-            if (!pipe.branch_recover || ((pipe.branch_dest & ~31) == pipe.icache_wait_addr)) {
+    /* if a branch recovery is scheduled this cycle, do not fetch from old PC */
+    if (pipe.branch_recover) {
+        /* However, if icache was waiting and was NOT cancelled (i.e. branch is to the SAME block),
+         * and the fill cycle has arrived, perform the fill into L1 icache! */
+        if (pipe.icache_wait && stat_cycles >= pipe.icache_fill_cycle) {
+            if ((pipe.branch_dest >> 5) == (pipe.icache_wait_addr >> 5)) {
                 cache_update(pipe.icache, pipe.icache_wait_addr);
 #ifdef DEBUG
                 printf("icache fill at %d\n", stat_cycles);
 #endif
             }
+            pipe.icache_wait = 0;
+            pipe.icache_fill_cycle = NO_CYCLE;
+        }
+        return;
+    }
+
+    /* if we are stalling on an icache miss, wait for fill cycle */
+    // same conceptual logic as MEM stage, but this time in FETCH for INSTRUCTIONS
+    if (pipe.icache_wait) {
+        if (stat_cycles >= pipe.icache_fill_cycle) {
+            cache_update(pipe.icache, pipe.icache_wait_addr);
+#ifdef DEBUG
+            printf("icache fill at %d\n", stat_cycles);
+#endif
             pipe.icache_wait = 0;
             pipe.icache_fill_cycle = NO_CYCLE;
         }
